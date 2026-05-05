@@ -580,6 +580,18 @@ export class RealtimeServiceV2 extends EventEmitter {
           this.accumulatedMarketTokenIds.delete(tokenId);
         }
 
+        // H0 fix (2026-05-03): explicit UNSUBSCRIBE to server
+        // Polymarket WS is stateful add/remove (verified via docs.polymarket.com).
+        // Without this call, server accumulates subscriptions → capacity exhausted →
+        // silent drop. Caused 38.5% crypto / 81% cs2 / 1.4% weather miss rate.
+        if (this.client && this.connected && tokenIds.length > 0) {
+          try {
+            this.client.unsubscribeMarket(tokenIds);
+          } catch (err) {
+            this.log(`unsubscribeMarket failed (non-fatal): ${err}`);
+          }
+        }
+
         // Re-subscribe with remaining tokens (or send empty to clear)
         this.scheduleMergedMarketSubscription();
 
