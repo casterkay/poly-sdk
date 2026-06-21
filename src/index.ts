@@ -94,6 +94,9 @@ export type {
 } from './clients/subgraph.js';
 
 // Services
+export { BaseStrategyService } from './services/base-strategy-service.js';
+export type { BaseStrategyServiceOptions } from './services/base-strategy-service.js';
+
 export { WalletService } from './services/wallet-service.js';
 export type {
   WalletProfile,
@@ -783,17 +786,20 @@ export class PolymarketSDK {
   /**
    * Stop SDK - disconnect all services and clean up
    */
-  stop(): void {
-    this.dipArb.stop();
-    this.realtime.disconnect();
+  async stop(): Promise<void> {
+    try {
+      await this.dipArb.stop();
+    } finally {
+      this.realtime.disconnect();
+    }
   }
 
   /**
    * Disconnect all services and clean up
    * @deprecated Use stop() instead
    */
-  disconnect(): void {
-    this.stop();
+  async disconnect(): Promise<void> {
+    await this.stop();
   }
 
   // ===== Unified Market Access =====

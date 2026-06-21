@@ -28,10 +28,8 @@
  * ```
  */
 
-import { EventEmitter } from 'events';
 import {
   RealtimeServiceV2,
-  type MarketSubscription,
   type OrderbookSnapshot,
   type Subscription,
   type CryptoPrice,
@@ -39,6 +37,7 @@ import {
 import { TradingService, type MarketOrderParams } from './trading-service.js';
 import { MarketService } from './market-service.js';
 import { CTFClient } from '../clients/ctf-client.js';
+import { BaseStrategyService } from './base-strategy-service.js';
 import type { Side } from '../core/types.js';
 import {
   type DipArbServiceConfig,
@@ -78,27 +77,17 @@ const log = createModuleLogger('dip-arb');
 
 // ===== DipArbService =====
 
-export class DipArbService extends EventEmitter {
-  // Dependencies
-  private realtimeService: RealtimeServiceV2;
-  private tradingService: TradingService | null = null;
-  private marketService: MarketService;
+export class DipArbService extends BaseStrategyService<DipArbMarketConfig, DipArbConfigInternal> {
   private ctf: CTFClient | null = null;
 
   // Configuration
-  private config: DipArbConfigInternal;
   private autoRotateConfig: Required<DipArbAutoRotateConfig>;
 
   // State
-  private market: DipArbMarketConfig | null = null;
   private currentRound: DipArbRoundState | null = null;
-  private isRunning = false;
-  private isExecuting = false;
-  private lastExecutionTime = 0;
   private stats: DipArbStats;
 
   // Subscriptions
-  private marketSubscription: MarketSubscription | null = null;
   private chainlinkSubscription: Subscription | null = null;
 
   // Auto-rotate state
@@ -137,14 +126,16 @@ export class DipArbService extends EventEmitter {
     privateKey?: string,
     chainId: number = 137
   ) {
-    super();
-
-    this.realtimeService = realtimeService;
-    this.tradingService = tradingService;
-    this.marketService = marketService;
+    super({
+      strategyName: 'DipArbService',
+      config: { ...DEFAULT_DIP_ARB_CONFIG },
+      realtimeService,
+      tradingService,
+      marketService,
+      alreadyRunningMessage: 'DipArbService is already running. Call stop() first.',
+    });
 
     // Initialize with default config
-    this.config = { ...DEFAULT_DIP_ARB_CONFIG };
     this.autoRotateConfig = { ...DEFAULT_AUTO_ROTATE_CONFIG };
     this.stats = createDipArbInitialStats();
 
@@ -195,7 +186,12 @@ export class DipArbService extends EventEmitter {
     } = options;
 
     try {
-      const gammaMarkets = await this.marketService.scanCryptoShortTermMarkets({
+      const marketService = this.marketService;
+      if (!marketService) {
+        throw new Error('DipArbService requires MarketService for market scanning');
+      }
+
+      const gammaMarkets = await marketService.scanCryptoShortTermMarkets({
         coin: coin as 'BTC' | 'ETH' | 'SOL' | 'XRP' | 'all',
         duration: duration as '5m' | '15m' | 'all',
         minMinutesUntilEnd,
@@ -213,7 +209,7 @@ export class DipArbService extends EventEmitter {
         while (retries > 0) {
           try {
             // Get full market info from CLOB API via MarketService
-            const market = await this.marketService.getMarket(gm.conditionId);
+            const market = await marketService.getMarket(gm.conditionId);
 
             // Find UP and DOWN tokens
             const upToken = market.tokens.find(t =>
@@ -292,18 +288,17 @@ export class DipArbService extends EventEmitter {
   /**
    * Start monitoring a market
    */
-  async start(market: DipArbMarketConfig): Promise<void> {
-    if (this.isRunning) {
-      throw new Error('DipArbService is already running. Call stop() first.');
-    }
-
-    // Validate token IDs
+  protected validateMarket(market: DipArbMarketConfig): void {
     if (!market.upTokenId || !market.downTokenId) {
       throw new Error(`Invalid market config: missing token IDs. upTokenId=${market.upTokenId}, downTokenId=${market.downTokenId}`);
     }
+  }
 
-    this.market = market;
-    this.isRunning = true;
+  protected getMarketTokenIds(market: DipArbMarketConfig): string[] {
+    return [market.upTokenId, market.downTokenId];
+  }
+
+  protected async onBeforeStart(market: DipArbMarketConfig): Promise<void> {
     this.stats = createDipArbInitialStats();
     this.priceHistory = [];  // Clear price history for new market
 
@@ -315,39 +310,26 @@ export class DipArbService extends EventEmitter {
 
     // Initialize trading service if available
     if (this.tradingService) {
-      try {
-        await this.tradingService.initialize();
+      const initialized = await this.initializeTradingService({
+        rethrow: false,
+        onError: (error) => {
+          this.log(`Warning: Trading service init failed: ${error}`);
+        },
+      });
+      if (initialized) {
         this.log(`Wallet: ${this.ctf?.getAddress()}`);
-      } catch (error) {
-        this.log(`Warning: Trading service init failed: ${error}`);
       }
     } else {
       this.log('No wallet configured - monitoring only');
     }
+  }
 
-    // Connect realtime service and wait for connection
-    // connect() is async and returns a Promise that resolves when connected
-    await this.realtimeService.connect();
+  protected onAfterRealtimeConnected(): void {
     this.log('WebSocket connected');
+  }
 
-    // Subscribe to market orderbook
+  protected onAfterMarketSubscribed(market: DipArbMarketConfig): Promise<void> | void {
     this.log(`Subscribing to tokens: UP=${market.upTokenId.slice(0, 20)}..., DOWN=${market.downTokenId.slice(0, 20)}...`);
-    this.marketSubscription = this.realtimeService.subscribeMarkets(
-      [market.upTokenId, market.downTokenId],
-      {
-        onOrderbook: (book: OrderbookSnapshot) => {
-          // Handle the orderbook update (always)
-          this.handleOrderbookUpdate(book);
-
-          // Smart logging: only log at intervals, not every update
-          if (this.config.debug) {
-            this.updateOrderbookBuffer(book);
-            this.maybeLogOrderbookSummary();
-          }
-        },
-        onError: (error: Error) => this.emit('error', error),
-      }
-    );
 
     // Subscribe to Chainlink prices for the underlying asset
     // Format: ETH -> ETH/USD
@@ -365,11 +347,23 @@ export class DipArbService extends EventEmitter {
 
     // ✅ FIX: Check and merge existing pairs at startup
     if (this.ctf && this.config.autoMerge) {
-      await this.scanAndMergeExistingPairs();
+      return this.scanAndMergeExistingPairs();
     }
+  }
 
-    this.emit('started', market);
+  protected onStarted(): void {
     this.log('Monitoring for dip arbitrage opportunities...');
+  }
+
+  protected handleOrderbookUpdate(book: OrderbookSnapshot): void {
+    // Handle the orderbook update (always)
+    this.processOrderbookUpdate(book);
+
+    // Smart logging: only log at intervals, not every update
+    if (this.config.debug) {
+      this.updateOrderbookBuffer(book);
+      this.maybeLogOrderbookSummary();
+    }
   }
 
   /**
@@ -427,22 +421,9 @@ export class DipArbService extends EventEmitter {
     }
   }
 
-  /**
-   * Stop monitoring
-   */
-  async stop(): Promise<void> {
-    if (!this.isRunning) return;
-
-    this.isRunning = false;
-
+  protected onBeforeStop(): void {
     // Stop rotate check
     this.stopRotateCheck();
-
-    // Unsubscribe
-    if (this.marketSubscription) {
-      this.marketSubscription.unsubscribe();
-      this.marketSubscription = null;
-    }
 
     if (this.chainlinkSubscription) {
       this.chainlinkSubscription.unsubscribe();
@@ -451,13 +432,13 @@ export class DipArbService extends EventEmitter {
 
     // Update stats
     this.stats.runningTimeMs = Date.now() - this.stats.startTime;
+  }
 
+  protected onAfterStop(): void {
     this.log('Stopped');
     this.log(`Rounds monitored: ${this.stats.roundsMonitored}`);
     this.log(`Rounds completed: ${this.stats.roundsSuccessful}`);
     this.log(`Total profit: $${this.stats.totalProfit.toFixed(2)}`);
-
-    this.emit('stopped');
   }
 
   /**
@@ -882,7 +863,7 @@ export class DipArbService extends EventEmitter {
 
   // ===== Private: Event Handlers =====
 
-  private handleOrderbookUpdate(book: OrderbookSnapshot): void {
+  private processOrderbookUpdate(book: OrderbookSnapshot): void {
     if (!this.market) return;
 
     // Determine which side this update is for

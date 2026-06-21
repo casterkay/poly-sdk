@@ -19,14 +19,13 @@
  * Docs: docs/arbitrage.md
  */
 
-import { EventEmitter } from 'events';
 import {
   RealtimeServiceV2,
-  type MarketSubscription,
   type OrderbookSnapshot,
 } from './realtime-service-v2.js';
 import { TradingService } from './trading-service.js';
 import { MarketService } from './market-service.js';
+import { BaseStrategyService } from './base-strategy-service.js';
 import { CTFClient, type TokenIds } from '../clients/ctf-client.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { RateLimiter } from '../core/rate-limiter.js';
@@ -248,19 +247,15 @@ export interface ArbitrageServiceEvents {
 
 // ===== ArbitrageService =====
 
-export class ArbitrageService extends EventEmitter {
-  private realtimeService: RealtimeServiceV2;
-  private marketSubscription: MarketSubscription | null = null;
-  private ctf: CTFClient | null = null;
-  private tradingService: TradingService | null = null;
-  private rateLimiter: RateLimiter;
+type ArbitrageConfigInternal = Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval'> & {
+  privateKey?: string;
+  rpcUrl?: string;
+  rebalanceIntervalMs: number;
+};
 
-  private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval'> & {
-    privateKey?: string;
-    rpcUrl?: string;
-    rebalanceIntervalMs: number;
-  };
+export class ArbitrageService extends BaseStrategyService<ArbitrageMarketConfig, ArbitrageConfigInternal> {
+  private ctf: CTFClient | null = null;
+  private rateLimiter: RateLimiter;
 
   private orderbook: OrderbookState = {
     yesBids: [],
@@ -277,12 +272,9 @@ export class ArbitrageService extends EventEmitter {
     lastUpdate: 0,
   };
 
-  private isExecuting = false;
-  private lastExecutionTime = 0;
   private lastRebalanceTime = 0;
   private balanceUpdateInterval: ReturnType<typeof setInterval> | null = null;
   private rebalanceInterval: ReturnType<typeof setInterval> | null = null;
-  private isRunning = false;
   private totalCapital = 0;
 
   // Statistics
@@ -295,9 +287,7 @@ export class ArbitrageService extends EventEmitter {
   };
 
   constructor(config: ArbitrageServiceConfig = {}) {
-    super();
-
-    this.config = {
+    const resolvedConfig: ArbitrageConfigInternal = {
       privateKey: config.privateKey,
       rpcUrl: config.rpcUrl || 'https://polygon-rpc.com',
       profitThreshold: config.profitThreshold ?? 0.005,
@@ -320,8 +310,26 @@ export class ArbitrageService extends EventEmitter {
       autoFixImbalance: config.autoFixImbalance ?? true,
     };
 
-    this.rateLimiter = new RateLimiter();
-    this.realtimeService = new RealtimeServiceV2({ debug: false });
+    const rateLimiter = new RateLimiter();
+    let tradingService: TradingService | null = null;
+    if (resolvedConfig.privateKey) {
+      const cache = createUnifiedCache();
+      tradingService = new TradingService(rateLimiter, cache, {
+        privateKey: resolvedConfig.privateKey,
+        chainId: 137,
+      });
+    }
+
+    super({
+      strategyName: 'ArbitrageService',
+      config: resolvedConfig,
+      realtimeService: new RealtimeServiceV2({ debug: false }),
+      tradingService,
+      disconnectRealtimeOnStop: true,
+      alreadyRunningMessage: 'ArbitrageService is already running. Call stop() first.',
+    });
+
+    this.rateLimiter = rateLimiter;
 
     // Initialize trading clients if private key provided
     if (this.config.privateKey) {
@@ -329,29 +337,26 @@ export class ArbitrageService extends EventEmitter {
         privateKey: this.config.privateKey,
         rpcUrl: this.config.rpcUrl,
       });
-
-      const cache = createUnifiedCache();
-      this.tradingService = new TradingService(this.rateLimiter, cache, {
-        privateKey: this.config.privateKey,
-        chainId: 137,
-      });
     }
 
     // RealtimeServiceV2 event handlers are set up during subscription
   }
 
-  // ===== Public API =====
+  protected getMarketTokenIds(market: ArbitrageMarketConfig): string[] {
+    return [market.yesTokenId, market.noTokenId];
+  }
 
-  /**
-   * Start monitoring a market for arbitrage opportunities
-   */
-  async start(market: ArbitrageMarketConfig): Promise<void> {
-    if (this.isRunning) {
-      throw new Error('ArbitrageService is already running. Call stop() first.');
-    }
+  protected handleOrderbookUpdate(book: OrderbookSnapshot): void {
+    const bookUpdate: BookUpdate = {
+      assetId: book.assetId,
+      bids: book.bids,
+      asks: book.asks,
+      timestamp: book.timestamp,
+    };
+    this.handleBookUpdate(bookUpdate);
+  }
 
-    this.market = market;
-    this.isRunning = true;
+  protected async onBeforeStart(market: ArbitrageMarketConfig): Promise<void> {
     this.stats.startTime = Date.now();
 
     this.log(`Starting arbitrage monitor for: ${market.name}`);
@@ -361,7 +366,7 @@ export class ArbitrageService extends EventEmitter {
 
     // Initialize trading service
     if (this.tradingService) {
-      await this.tradingService.initialize();
+      await this.initializeTradingService();
       this.log(`Wallet: ${this.ctf?.getAddress()}`);
       await this.updateBalance();
       this.log(`USDC Balance: ${this.balance.usdc.toFixed(2)}`);
@@ -387,39 +392,13 @@ export class ArbitrageService extends EventEmitter {
     } else {
       this.log('No wallet configured - monitoring only');
     }
+  }
 
-    // Connect and subscribe to WebSocket
-    // connect() is async and returns a Promise that resolves when connected
-    await this.realtimeService.connect();
-    this.marketSubscription = this.realtimeService.subscribeMarkets(
-      [market.yesTokenId, market.noTokenId],
-      {
-        onOrderbook: (book: OrderbookSnapshot) => {
-          // Convert OrderbookSnapshot to BookUpdate format
-          const bookUpdate: BookUpdate = {
-            assetId: book.assetId,
-            bids: book.bids,
-            asks: book.asks,
-            timestamp: book.timestamp,
-          };
-          this.handleBookUpdate(bookUpdate);
-        },
-        onError: (error: Error) => this.emit('error', error),
-      }
-    );
-
-    this.emit('started', market);
+  protected onStarted(): void {
     this.log('Monitoring for arbitrage opportunities...');
   }
 
-  /**
-   * Stop monitoring
-   */
-  async stop(): Promise<void> {
-    if (!this.isRunning) return;
-
-    this.isRunning = false;
-
+  protected onBeforeStop(): void {
     if (this.balanceUpdateInterval) {
       clearInterval(this.balanceUpdateInterval);
       this.balanceUpdateInterval = null;
@@ -429,21 +408,16 @@ export class ArbitrageService extends EventEmitter {
       clearInterval(this.rebalanceInterval);
       this.rebalanceInterval = null;
     }
+  }
 
-    // Unsubscribe and disconnect
-    if (this.marketSubscription) {
-      this.marketSubscription.unsubscribe();
-      this.marketSubscription = null;
-    }
-    this.realtimeService.disconnect();
-
+  protected onAfterStop(): void {
     this.log('Stopped');
     this.log(`Total opportunities: ${this.stats.opportunitiesDetected}`);
     this.log(`Executions: ${this.stats.executionsSucceeded}/${this.stats.executionsAttempted}`);
     this.log(`Total profit: $${this.stats.totalProfit.toFixed(2)}`);
-
-    this.emit('stopped');
   }
+
+  // ===== Public API =====
 
   /**
    * Get current orderbook state

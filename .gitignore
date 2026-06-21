@@ -32,3 +32,5 @@ coverage/
 .cache/
 *.tsbuildinfo
 .mcp.json.test-creds.json
+
+_refs/
