@@ -34,3 +34,6 @@ coverage/
 .mcp.json.test-creds.json
 
 _refs/
+.agents/
+USER.md
+MEMORY.md
